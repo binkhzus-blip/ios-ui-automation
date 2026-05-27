@@ -1,6 +1,6 @@
 ---
 name: ios-ui-automation
-description: Use when driving an iOS simulator app programmatically — tapping, swiping, typing, reading UI state, or taking screenshots. Triggers include UI automation, exploratory testing, reproducing a user-reported bug on the simulator, verifying a flow end-to-end, or any "please click X in the app" request targeting an iOS simulator. Tool-neutral — IDB preferred, WDA / Appium / simctl as fallbacks.
+description: Use when driving an iOS app programmatically — tapping, swiping, typing, reading UI state, or taking screenshots. Triggers include UI automation, exploratory testing, reproducing a user-reported bug, verifying a flow end-to-end, or any "please click X in the app" request. Covers both simulator (IDB preferred) and real device (iOS 17+ via Appium-wrapped WDA). Tool-neutral — IDB / WDA / Appium / simctl as appropriate.
 ---
 
 # iOS UI Automation
@@ -168,14 +168,15 @@ status: ✅ end-to-end working
 
 ## Tool Preference
 
-| Tool | When to use | Install |
-|---|---|---|
-| **IDB** | First choice. `describe-all` + `describe-point` give exact frames via accessibility API | `brew install facebook/fb/idb-companion` + `pip3 install fb-idb` |
-| **WDA** (WebDriverAgent) | Fallback when IDB is unavailable. Richer features (sessions, alert handling) | Clone appium/WebDriverAgent, `xcodebuild ... test` |
-| **simctl** | Low-level ops: install/uninstall, URL schemes, push, keychain, privacy | Built into Xcode |
-| **Appium** | Cross-platform or if the team already has test infrastructure | Separate setup |
+| Tool | Simulator | Real device (iOS 17+) | Install |
+|---|---|---|---|
+| **IDB** | ✅ First choice. `describe-all` + `describe-point` give exact frames via accessibility API | ❌ companion can't pin to real-device UDID | `brew install facebook/fb/idb-companion` + `pip3 install fb-idb` |
+| **Appium + WDA** | Fallback. Heavier than IDB | ✅ **First choice for real device.** Wraps WDA with keep-alive / auto-restart — necessary because iOS 17+ jetsam kills backgrounded xctest runners | `npm install -g appium && appium driver install xcuitest` |
+| **Raw WDA via `pymobiledevice3 wda`** | n/a | ❌ Don't. xctrunner gets jetsam'd within seconds of launching the app under test → :8100 dies → unrecoverable | n/a |
+| **simctl** | ✅ Low-level ops: install/uninstall, URL schemes, push, keychain, privacy | n/a (simulator only) | Built into Xcode |
+| **`xcrun devicectl` + `pymobiledevice3`** | n/a | ✅ Install/launch/screenshot/file-pull on real device (no UI tap) | `xcrun devicectl` built-in; `pipx install pymobiledevice3` |
 
-## Prerequisites (IDB path)
+## Prerequisites (IDB path — simulator)
 
 1. App running on simulator.
 2. `idb_companion` running, pinned to the right simulator:
@@ -185,6 +186,86 @@ status: ✅ end-to-end working
    idb connect localhost <port_from_log>
    ```
 3. Verify: `idb list-targets | grep <UDID>` shows `localhost:<port>` at the end.
+
+## Prerequisites (Appium path — real device, iOS 17+)
+
+Real-device UI automation requires wrapping WDA in Appium. **Don't try raw `pymobiledevice3 developer wda launch -xc`** — the xctrunner gets jetsam'd within seconds of launching the app under test (iOS 17+ background xctest policy), and the HTTP session never recovers. Appium handles the lifecycle (keep-alive ping, auto-restart on crash).
+
+One-time setup:
+
+1. **Tunneld** (RSD tunnel for iOS 17+):
+   ```bash
+   sudo pymobiledevice3 remote tunneld &       # runs on :49151
+   curl -sS http://127.0.0.1:49151/             # returns {"<UDID>":[{...}]}
+   ```
+2. **Trust + Developer Mode + unlocked screen** on the device.
+3. **Pre-build a signed WDA** in a stable location (e.g. `~/code/WebDriverAgent`). Open in Xcode → assign a team that has a wildcard provisioning profile (a personal Apple ID with `<team>.*` works fine for dev). Build once via `xcodebuild ... test` so DerivedData has `WebDriverAgentRunner-Runner.app`. This is the WDA Appium will reuse.
+   - Verify signing with `codesign -dvvv` — note the actual `TeamIdentifier` and `Identifier`; pass these to Appium below.
+4. **Install Appium + xcuitest driver**:
+   ```bash
+   npm install -g appium                     # appium 3.x
+   appium driver install xcuitest            # xcuitest 11.x (ships appium-ios-remotexpc for iOS 18+ RemoteXPC)
+   appium driver doctor xcuitest             # must show all required ✅
+   ```
+
+Per-session:
+
+```bash
+# Start server (PATH must include /usr/sbin so lsof is reachable)
+PATH="/usr/sbin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
+  appium --address 127.0.0.1 --port 4723 --log /tmp/appium/server.log &
+
+# Create session against the real device + app
+curl -sS --noproxy '*' -X POST http://127.0.0.1:4723/session \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "capabilities": {
+      "alwaysMatch": {
+        "platformName": "iOS",
+        "appium:automationName": "XCUITest",
+        "appium:udid": "<DEVICE-UDID>",
+        "appium:platformVersion": "<iOS-version>",
+        "appium:bundleId": "<app-bundle-id>",
+        "appium:xcodeOrgId": "<team-from-codesign-dvvv>",
+        "appium:xcodeSigningId": "Apple Development",
+        "appium:bootstrapPath": "/path/to/your/WebDriverAgent",
+        "appium:derivedDataPath": "/path/to/DerivedData/WebDriverAgent-<hash>",
+        "appium:noReset": true,
+        "appium:newCommandTimeout": 600
+      }
+    }
+  }'
+# returns {"value":{"sessionId":"...","capabilities":{...}}}
+```
+
+**Why `bootstrapPath` + `derivedDataPath` are critical**: by default Appium uses its own WDA copy under `~/.appium/node_modules/.../appium-webdriveragent/` and invokes `xcodebuild` **without** `-allowProvisioningUpdates`. Any new xctrunner bundle id (e.g. `com.tech.WDA.xctrunner`) has no provisioning profile → `xcodebuild` exits 65. Pointing at a pre-built, pre-signed WDA bypasses the rebuild entirely.
+
+Per-action (W3C actions API):
+
+```bash
+SID=<sessionId from session create response>
+
+# Tap at logical (x, y) — NOT screenshot pixels
+curl -sS --noproxy '*' -X POST "http://127.0.0.1:4723/session/$SID/actions" \
+  -H 'Content-Type: application/json' \
+  -d "{\"actions\":[{\"type\":\"pointer\",\"id\":\"f1\",\"parameters\":{\"pointerType\":\"touch\"},\"actions\":[{\"type\":\"pointerMove\",\"duration\":0,\"x\":X,\"y\":Y},{\"type\":\"pointerDown\",\"button\":0},{\"type\":\"pause\",\"duration\":80},{\"type\":\"pointerUp\",\"button\":0}]}]}"
+
+# Screenshot (base64 PNG in .value)
+curl -sS --noproxy '*' "http://127.0.0.1:4723/session/$SID/screenshot" \
+  | python3 -c "import json,sys,base64; open('/tmp/s.png','wb').write(base64.b64decode(json.load(sys.stdin)['value']))"
+```
+
+**Real-device gotchas (in addition to the simulator ones):**
+
+| Gotcha | Fix |
+|---|---|
+| Local proxy intercepts IPv6 → curl to RSD tunnel returns 502 | Always `--noproxy '*'` on Appium/WDA curls |
+| Appium PATH doesn't include `/usr/sbin` → `lsof not found` → can't clean stale ports | `export PATH=/usr/sbin:...` before launching appium |
+| WDA stops responding mid-session (system reclaim) | Appium auto-rebuilds; raise `newCommandTimeout` to avoid premature kills |
+| First session creation is slow (~30s) for xcodebuild test-without-building handshake | Expected; subsequent sessions are faster (cache hits) |
+| Screen sleeps → lockdownd unadvertises → screenshot fails "Device is not connected" | Keep screen unlocked; consider AssistiveTouch tap to wake |
+
+For project-specific recipes (exact paths, team ID, pre-built DerivedData location, app coordinates), check the project's `automation-playbooks/_devices/<device>.md`.
 
 ## Core Endpoints (IDB)
 
@@ -298,7 +379,8 @@ done
 ## Recovery Patterns
 
 - **IDB companion hung** → `pkill idb_companion`; restart + reconnect
-- **WDA snapshot stalled** → `pkill -f "xcodebuild.*WebDriverAgent"`; restart from scratch
+- **WDA snapshot stalled (simulator)** → `pkill -f "xcodebuild.*WebDriverAgent"`; restart from scratch
+- **Appium session died (real device)** → DELETE `/session/<sid>`; create a fresh session. Appium will re-launch WDA via `xcodebuild test-without-building`. If that also fails, check `lsof -i :8100` for stale processes, then re-create.
 - **App lost login state** → reinstall may wipe UserDefaults; log in first or inject auth token
 
 ## Common Mistakes
@@ -320,4 +402,4 @@ done
 
 - Unit tests — use XCTest directly.
 - CI regression — use XCUITest / Appium with structured test cases.
-- Real device automation — WDA works with signing; IDB companion needs separate setup.
+- Throughput-critical automated test suites — this skill is for exploratory / one-off / bug-repro work, not for sustained CI load.
