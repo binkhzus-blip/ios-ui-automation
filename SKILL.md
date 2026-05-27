@@ -261,9 +261,39 @@ curl -sS --noproxy '*' "http://127.0.0.1:4723/session/$SID/screenshot" \
 |---|---|
 | Local proxy intercepts IPv6 → curl to RSD tunnel returns 502 | Always `--noproxy '*'` on Appium/WDA curls |
 | Appium PATH doesn't include `/usr/sbin` → `lsof not found` → can't clean stale ports | `export PATH=/usr/sbin:...` before launching appium |
-| WDA stops responding mid-session (system reclaim) | Appium auto-rebuilds; raise `newCommandTimeout` to avoid premature kills |
-| First session creation is slow (~30s) for xcodebuild test-without-building handshake | Expected; subsequent sessions are faster (cache hits) |
+| WDA stops responding mid-session (system reclaim, ~30 min sustained use) | Appium auto-rebuilds; raise `newCommandTimeout` to avoid premature kills. If WDA crashes, DELETE the session + create new one — rebuild uses pre-built derivedData in <1s |
+| First session creation is slow (~30s) for xcodebuild test-without-building handshake | Expected; subsequent sessions are ~400ms (cache hits) |
 | Screen sleeps → lockdownd unadvertises → screenshot fails "Device is not connected" | Keep screen unlocked; consider AssistiveTouch tap to wake |
+| `setPasteboard` + long press to paste text | Doesn't work on iOS 26+ — long press on a TextView surfaces autofill, not the Paste menu. Stick with `POST /element/{eid}/value` for typing |
+
+### Performance baseline (real device, what's the floor?)
+
+For "cold-start app → tap into a role/chat → send a 13-char text → wait for AI reply" on iPhone 12 Pro / iOS 26.5:
+
+| Stage | ~Time | Hard floor? |
+|---|---|---|
+| `terminate_app` + `activate_app` + first frame | 3 s | Yes — app process launch dominates |
+| Tap conversation → chat page interactive | 1.5 s | Yes (app render bound) |
+| Tap input + type 13 chars via IME + tap send | 5 s | **Type is the bottleneck**: ~270ms/char × 13 = 3.5s. Cannot escape via paste on iOS 26+ |
+| Click send → AI reply text complete | 5–7 s | Server-side LLM bound |
+| **End-to-end** | **14–16 s** | At-or-near human-pace floor |
+
+Optimizations that worked: W3C coordinate tap (saves 200-500ms vs element click), session reuse without terminate (saves entire Stage 1).
+
+Optimizations that **don't** work: paste menu (autofill in the way), raising `maxTypingFrequency` (IME still rate-limited).
+
+### Polling signals — wrong vs right
+
+Detecting when an AI reply has arrived is harder than it sounds. Anti-patterns to avoid:
+
+| Signal | Problem |
+|---|---|
+| `len(source) > baseline + N` | Chat scrolling drops old bubbles **out** of source as new ones arrive → source can shrink → false negative |
+| Count of `visible="true"` TextView bubbles | Same scrolling problem; count can go +1 then back to baseline |
+| Diff of set of `value="..."` strings | Robust to scroll, but each `source` RPC is ~2.8s under load → polling cadence dominated by RPC latency |
+| Screenshot md5 hash equality | Status bar clock seconds + animations change hash every second → need region crop or "stable for N frames" smoothing |
+
+What actually works: **predicate-find a UI element specific to the expected post-state** (e.g. a `Send` button that's only enabled when text is in the input; a static text containing a known reply keyword). Poll every 200-300ms with a small fixed cap. Combine with one final screenshot for sanity.
 
 For project-specific recipes (exact paths, team ID, pre-built DerivedData location, app coordinates), check the project's `automation-playbooks/_devices/<device>.md`.
 
